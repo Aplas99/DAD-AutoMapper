@@ -112,6 +112,19 @@ def recommended_tempo_mapping(base_tempo: float, sections: list[TempoSection]) -
     return _snap_tempo(base_tempo * multiplier), adjusted_sections
 
 
+def sexy_tempo_mapping(base_tempo: float, sections: list[TempoSection]) -> tuple[float, list[TempoSection]]:
+    new_base = _snap_tempo(base_tempo * 2.0) if base_tempo < 120.0 else base_tempo
+    new_sections = [
+        TempoSection(
+            tempo=_snap_tempo(s.tempo * 2.0) if s.tempo < 120.0 else s.tempo,
+            start_time=s.start_time,
+            confidence=s.confidence,
+        )
+        for s in sections
+    ]
+    return new_base, new_sections
+
+
 def recommended_section_tempo_mapping(sections: list[TempoSection], threshold: float = 120.0) -> list[TempoSection]:
     adjusted_sections: list[TempoSection] = []
     for section in sections:

@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .analysis import analyze_audio, recommended_section_tempo_mapping, recommended_tempo_mapping
+from .analysis import analyze_audio, recommended_section_tempo_mapping, recommended_tempo_mapping, sexy_tempo_mapping
 from .exporter import export_project
 from .models import AnalysisResult, SongProject, TempoSection
 
@@ -144,6 +144,10 @@ class MainWindow(QMainWindow):
         self.recommended_sections_button = QPushButton("Recommended Sections")
         self.recommended_sections_button.clicked.connect(self._apply_recommended_sections)
         sidebar_layout.addWidget(self.recommended_sections_button)
+
+        self.sexy_button = QPushButton("Sexy")
+        self.sexy_button.clicked.connect(self._apply_sexy)
+        sidebar_layout.addWidget(self.sexy_button)
 
         form = QFormLayout()
         self.song_name = QLineEdit("Imported Song")
@@ -362,6 +366,33 @@ class MainWindow(QMainWindow):
             f"Recommended Sections promoted {changes} marker"
             f"{'' if changes == 1 else 's'} below 120 BPM to a stronger 4/4 pulse."
         )
+
+    def _apply_sexy(self) -> None:
+        if self.project.base_tempo <= 0:
+            QMessageBox.information(self, "No Tempo", "Run Auto Detect or enter a BPM first.")
+            return
+        original_base = self.project.base_tempo
+        new_base, new_sections = sexy_tempo_mapping(self.project.base_tempo, self.project.tempo_sections)
+        base_changed = abs(new_base - original_base) >= 0.01
+        section_changes = sum(
+            1
+            for original, updated in zip(self.project.tempo_sections, new_sections)
+            if abs(original.tempo - updated.tempo) >= 0.01
+        )
+        if not base_changed and section_changes == 0:
+            self.status_label.setText("Sexy found nothing below 120 BPM to double.")
+            return
+        self.project.base_tempo = new_base
+        self.project.tempo_sections = new_sections
+        self._sync_controls()
+        self._draw_beat_grid()
+        self._refresh_sections()
+        parts = []
+        if base_changed:
+            parts.append(f"base {original_base:.2f} → {new_base:.2f} BPM")
+        if section_changes:
+            parts.append(f"{section_changes} section{'' if section_changes == 1 else 's'} doubled")
+        self.status_label.setText("Sexy: " + ", ".join(parts) + ".")
 
     def _apply_song_name(self, value: str) -> None:
         self.project.song_name = value.strip() or "Imported Song"
