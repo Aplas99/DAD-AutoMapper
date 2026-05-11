@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import math
 import struct
 import tempfile
@@ -51,6 +52,7 @@ class _MMBOffsetFilter(QObject):
             self._active = True
             self._start_x = float(event.position().x())
             self._start_offset = self._window.offset_spin.value()
+            self._window._push_undo()
             return True
         if t == QEvent.Type.MouseMove and self._active:
             delta_px = float(event.position().x()) - self._start_x
@@ -92,6 +94,8 @@ class MainWindow(QMainWindow):
         self.metronome_sound = QSoundEffect(self)
         self.metronome_sound.setVolume(0.18)
         self.metronome_sound.setSource(QUrl.fromLocalFile(str(self._ensure_metronome_sound())))
+
+        self._undo_stack: list[dict] = []
 
         self._build_ui()
         self._load_settings()
@@ -148,6 +152,11 @@ class MainWindow(QMainWindow):
         self.sexy_button = QPushButton("Sexy")
         self.sexy_button.clicked.connect(self._apply_sexy)
         sidebar_layout.addWidget(self.sexy_button)
+
+        self.undo_button = QPushButton("Undo")
+        self.undo_button.clicked.connect(self._undo)
+        self.undo_button.setEnabled(False)
+        sidebar_layout.addWidget(self.undo_button)
 
         form = QFormLayout()
         self.song_name = QLineEdit("Imported Song")
@@ -286,10 +295,38 @@ class MainWindow(QMainWindow):
         self.player.setSource(QUrl.fromLocalFile(str(song_path)))
         self.status_label.setText(f"Loaded {song_path.name}. Run Auto Detect next.")
 
+    def _push_undo(self) -> None:
+        self._undo_stack.append({
+            "base_tempo":        self.project.base_tempo,
+            "beat_offset":       self.project.beat_offset,
+            "start_song_offset": self.project.start_song_offset,
+            "end_song_offset":   self.project.end_song_offset,
+            "tempo_sections":    copy.deepcopy(self.project.tempo_sections),
+        })
+        if len(self._undo_stack) > 30:
+            self._undo_stack.pop(0)
+        self.undo_button.setEnabled(True)
+
+    def _undo(self) -> None:
+        if not self._undo_stack:
+            return
+        state = self._undo_stack.pop()
+        self.project.base_tempo        = state["base_tempo"]
+        self.project.beat_offset       = state["beat_offset"]
+        self.project.start_song_offset = state["start_song_offset"]
+        self.project.end_song_offset   = state["end_song_offset"]
+        self.project.tempo_sections    = state["tempo_sections"]
+        self._sync_controls()
+        self._draw_beat_grid()
+        self._refresh_sections()
+        self.undo_button.setEnabled(bool(self._undo_stack))
+        self.status_label.setText("Undone.")
+
     def _auto_detect(self) -> None:
         if not self.project.audio_path:
             QMessageBox.warning(self, "No Audio", "Load an audio file first.")
             return
+        self._push_undo()
         self._set_busy(True, "Analyzing audio...")
         try:
             self.analysis_result = analyze_audio(self.project.audio_path)
@@ -325,6 +362,7 @@ class MainWindow(QMainWindow):
         if self.project.base_tempo <= 0:
             QMessageBox.information(self, "No Tempo", "Run Auto Detect or enter a BPM first.")
             return
+        self._push_undo()
         original_tempo = self.project.base_tempo
         recommended_tempo, recommended_sections = recommended_tempo_mapping(
             self.project.base_tempo,
@@ -349,6 +387,7 @@ class MainWindow(QMainWindow):
         if not self.project.tempo_sections:
             QMessageBox.information(self, "No Sections", "Load a map with tempo sections first.")
             return
+        self._push_undo()
         original_sections = list(self.project.tempo_sections)
         recommended_sections = recommended_section_tempo_mapping(self.project.tempo_sections)
         changes = sum(
@@ -371,6 +410,7 @@ class MainWindow(QMainWindow):
         if self.project.base_tempo <= 0:
             QMessageBox.information(self, "No Tempo", "Run Auto Detect or enter a BPM first.")
             return
+        self._push_undo()
         original_base = self.project.base_tempo
         new_base, new_sections = sexy_tempo_mapping(self.project.base_tempo, self.project.tempo_sections)
         base_changed = abs(new_base - original_base) >= 0.01
@@ -517,6 +557,7 @@ class MainWindow(QMainWindow):
         return max(0.0, min(float(self.player.position()) / 1000.0, self.project.duration))
 
     def _add_marker_at_playhead(self) -> None:
+        self._push_undo()
         time_value = self._cursor_seconds()
         tempo = self.bpm_spin.value()
         self.project.tempo_sections.append(TempoSection(tempo=tempo, start_time=round(time_value, 4), confidence=1.0))
@@ -528,6 +569,7 @@ class MainWindow(QMainWindow):
         row = self.section_list.currentRow()
         if row < 0:
             return
+        self._push_undo()
         self.project.tempo_sections[row] = TempoSection(
             tempo=self.bpm_spin.value(),
             start_time=round(self._cursor_seconds(), 4),
@@ -541,6 +583,7 @@ class MainWindow(QMainWindow):
         row = self.section_list.currentRow()
         if row < 0:
             return
+        self._push_undo()
         del self.project.tempo_sections[row]
         self._refresh_sections()
         self._draw_beat_grid()
