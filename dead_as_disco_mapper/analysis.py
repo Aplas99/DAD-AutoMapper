@@ -76,9 +76,22 @@ def analyze_audio(audio_path: str | Path, config: DetectionConfig | None = None)
 
     try:
         btt = analyze_with_btt(audio_file, profile="fast_tempo")
-        # Waveform is pure visualisation — load at the lower rate for efficiency.
         samples, sr = librosa.load(audio_file, sr=cfg.sample_rate, mono=True)
         waveform_times, waveform_values, raw_waveform_values = _build_waveform(samples, sr, cfg.waveform_points)
+
+        # Structural segmentation uses MFCC (acoustic/timbral changes) as boundary
+        # candidates.  Per-segment tempo estimation uses BTT's accurate base BPM and
+        # beat grid so the reference is correct even for high-BPM songs.
+        boundaries = _structural_boundaries(samples, sr, cfg.section_min_length)
+        sections = _sections_from_boundaries(
+            samples,
+            sr,
+            btt.beat_times,
+            btt.base_tempo,
+            boundaries,
+            cfg.section_min_length,
+            cfg.section_change_threshold,
+        )
         return AnalysisResult(
             audio_path=audio_file,
             sample_rate=btt.sample_rate,
@@ -86,7 +99,7 @@ def analyze_audio(audio_path: str | Path, config: DetectionConfig | None = None)
             base_tempo=btt.base_tempo,
             beat_offset=btt.beat_offset,
             beat_times=btt.beat_times,
-            tempo_sections=btt.tempo_sections,
+            tempo_sections=sections,
             waveform_times=waveform_times,
             waveform_values=waveform_values,
             raw_waveform_values=raw_waveform_values,
@@ -187,6 +200,43 @@ def _estimate_beat_offset(beat_times: list[float], tempo: float) -> float:
     beat_length = 60.0 / float(tempo)
     reference = beat_times[0]
     return round(reference % beat_length, 4)
+
+
+def _sections_from_boundaries(
+    samples: np.ndarray,
+    sr: int,
+    beat_times: list[float],
+    base_tempo: float,
+    boundaries: list[float],
+    min_length: float,
+    change_threshold: float,
+    min_confidence: float = 0.35,
+) -> list[TempoSection]:
+    """Estimate per-segment tempos from pre-computed boundary list."""
+    if len(boundaries) < 2:
+        return []
+
+    sections: list[TempoSection] = []
+    previous_tempo = base_tempo
+
+    for start_time, end_time in zip(boundaries[:-1], boundaries[1:]):
+        if end_time - start_time < min_length * 0.55:
+            continue
+        tempo, confidence = _refine_section_tempo(samples, sr, start_time, end_time, base_tempo)
+        if (
+            abs(tempo - previous_tempo) / max(previous_tempo, 1.0) >= change_threshold
+            and confidence >= min_confidence
+        ):
+            sections.append(
+                TempoSection(
+                    tempo=tempo,
+                    start_time=_snap_time_to_beats(start_time, beat_times),
+                    confidence=confidence,
+                )
+            )
+            previous_tempo = tempo
+
+    return _collapse_sections(sections, base_tempo, min_length)
 
 
 def _detect_sections(
