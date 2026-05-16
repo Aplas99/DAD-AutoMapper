@@ -75,13 +75,20 @@ def analyze_audio(audio_path: str | Path, config: DetectionConfig | None = None)
     audio_file = Path(audio_path)
 
     try:
-        btt = analyze_with_btt(audio_file, profile="fast_tempo")
+        # Default profile gives a reliable base BPM across all tempo ranges.
+        btt = analyze_with_btt(audio_file, profile="default")
+
+        # For high-BPM songs (≥150 BPM) BTT default's beat callbacks fire at the
+        # half-tempo alias, so the beat grid is wrong even though base_tempo is right.
+        # fast_tempo's histogram bias (weight mean 175) fixes the beat spacing for
+        # those songs.  For songs below 150 BPM the bias causes the opposite error
+        # (timeline votes for 200 BPM on a 115 BPM track), so we skip it there.
+        if btt.base_tempo >= 150:
+            btt = analyze_with_btt(audio_file, profile="fast_tempo")
+
         samples, sr = librosa.load(audio_file, sr=cfg.sample_rate, mono=True)
         waveform_times, waveform_values, raw_waveform_values = _build_waveform(samples, sr, cfg.waveform_points)
 
-        # Structural segmentation uses MFCC (acoustic/timbral changes) as boundary
-        # candidates.  Per-segment tempo estimation uses BTT's accurate base BPM and
-        # beat grid so the reference is correct even for high-BPM songs.
         boundaries = _structural_boundaries(samples, sr, cfg.section_min_length)
         sections = _sections_from_boundaries(
             samples,
