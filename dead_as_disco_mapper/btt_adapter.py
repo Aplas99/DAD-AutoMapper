@@ -158,26 +158,30 @@ class _LoadedBTTLibrary:
 
     @classmethod
     def load(cls) -> "_LoadedBTTLibrary":
-        source_root = _vendor_root()
-        if not source_root.exists():
-            raise BTTUnavailableError(
-                f"Vendored Beat-and-Tempo-Tracking source was not found at {source_root}."
-            )
+        import sys
+        frozen = getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")
 
         build_dir = _build_root()
-        build_dir.mkdir(parents=True, exist_ok=True)
         library_path = build_dir / _shared_library_name()
         metadata_path = build_dir / "build_metadata.json"
-        if _needs_rebuild(source_root, library_path):
-            _build_shared_library(source_root, build_dir, library_path, metadata_path)
+
+        if not frozen:
+            source_root = _vendor_root()
+            if not source_root.exists():
+                raise BTTUnavailableError(
+                    f"Vendored Beat-and-Tempo-Tracking source was not found at {source_root}."
+                )
+            build_dir.mkdir(parents=True, exist_ok=True)
+            if _needs_rebuild(source_root, library_path):
+                _build_shared_library(source_root, build_dir, library_path, metadata_path)
+
+        if not library_path.exists():
+            raise BTTUnavailableError(f"BTT shared library not found at {library_path}.")
 
         try:
             lib = ctypes.CDLL(str(library_path))
             return cls(lib, library_path, metadata_path)
         except AttributeError as exc:
-            # DLL loaded but required symbols are missing — the cached build predates the
-            # export fix. On Windows we can't delete a loaded DLL; the user must clear
-            # the build directory manually and re-run.
             raise BTTUnavailableError(
                 f"BTT library at {library_path} is missing required exports. "
                 f"Delete the build directory ({build_dir}) and rerun the benchmark to rebuild it."
@@ -353,6 +357,9 @@ def _vendor_root() -> Path:
 
 
 def _build_root() -> Path:
+    import sys
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)
     return Path(__file__).resolve().parents[1] / "build" / "btt"
 
 
