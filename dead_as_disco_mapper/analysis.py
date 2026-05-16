@@ -68,8 +68,33 @@ def _switch_threshold(candidate: float, base_tempo: float) -> float:
 
 
 def analyze_audio(audio_path: str | Path, config: DetectionConfig | None = None) -> AnalysisResult:
+    # Inline import breaks the circular dependency: btt_adapter imports COMMON_TEMPI from here.
+    from .btt_adapter import BTTUnavailableError, analyze_with_btt
+
     cfg = config or DetectionConfig()
     audio_file = Path(audio_path)
+
+    try:
+        btt = analyze_with_btt(audio_file, profile="fast_tempo")
+        # Waveform is pure visualisation — load at the lower rate for efficiency.
+        samples, sr = librosa.load(audio_file, sr=cfg.sample_rate, mono=True)
+        waveform_times, waveform_values, raw_waveform_values = _build_waveform(samples, sr, cfg.waveform_points)
+        return AnalysisResult(
+            audio_path=audio_file,
+            sample_rate=btt.sample_rate,
+            duration=btt.duration,
+            base_tempo=btt.base_tempo,
+            beat_offset=btt.beat_offset,
+            beat_times=btt.beat_times,
+            tempo_sections=btt.tempo_sections,
+            waveform_times=waveform_times,
+            waveform_values=waveform_values,
+            raw_waveform_values=raw_waveform_values,
+        )
+    except BTTUnavailableError:
+        pass
+
+    # Librosa fallback when the BTT native library cannot be built or loaded.
     samples, sr = librosa.load(audio_file, sr=cfg.sample_rate, mono=True)
     duration = float(librosa.get_duration(y=samples, sr=sr))
 

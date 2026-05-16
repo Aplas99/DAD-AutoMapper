@@ -17,11 +17,13 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -149,10 +151,6 @@ class MainWindow(QMainWindow):
         self.recommended_sections_button.clicked.connect(self._apply_recommended_sections)
         sidebar_layout.addWidget(self.recommended_sections_button)
 
-        self.sexy_button = QPushButton("Sexy")
-        self.sexy_button.clicked.connect(self._apply_sexy)
-        sidebar_layout.addWidget(self.sexy_button)
-
         self.undo_button = QPushButton("Undo")
         self.undo_button.clicked.connect(self._undo)
         self.undo_button.setEnabled(False)
@@ -167,7 +165,8 @@ class MainWindow(QMainWindow):
         self.bpm_spin.setRange(40.0, 260.0)
         self.bpm_spin.setDecimals(3)
         self.bpm_spin.setValue(120.0)
-        self.bpm_spin.valueChanged.connect(self._update_project_from_controls)
+        self.bpm_spin.setKeyboardTracking(False)
+        self.bpm_spin.lineEdit().returnPressed.connect(self._commit_bpm_spin)
         form.addRow("BPM", self.bpm_spin)
 
         self.offset_spin = QDoubleSpinBox()
@@ -193,6 +192,8 @@ class MainWindow(QMainWindow):
 
         self.section_list = QListWidget()
         self.section_list.currentRowChanged.connect(self._focus_section)
+        self.section_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.section_list.customContextMenuRequested.connect(self._open_section_context_menu)
         sidebar_layout.addWidget(QLabel("Tempo Sections"))
         sidebar_layout.addWidget(self.section_list, 1)
 
@@ -200,10 +201,6 @@ class MainWindow(QMainWindow):
         add_section = QPushButton("Add Marker")
         add_section.clicked.connect(self._add_marker_at_playhead)
         section_controls.addWidget(add_section)
-
-        replace_section = QPushButton("Replace")
-        replace_section.clicked.connect(self._replace_selected_marker)
-        section_controls.addWidget(replace_section)
 
         delete_section = QPushButton("Delete")
         delete_section.clicked.connect(self._delete_selected_marker)
@@ -223,6 +220,13 @@ class MainWindow(QMainWindow):
         self.metronome_box.toggled.connect(self._toggle_metronome)
         playback_controls.addWidget(self.metronome_box)
         sidebar_layout.addLayout(playback_controls)
+
+        self.music_volume_slider = QSlider(Qt.Horizontal)
+        self.music_volume_slider.setRange(0, 100)
+        self.music_volume_slider.setValue(80)
+        self.music_volume_slider.valueChanged.connect(self._update_music_volume)
+        sidebar_layout.addWidget(QLabel("Music Volume"))
+        sidebar_layout.addWidget(self.music_volume_slider)
 
         self.metronome_volume_slider = QSlider(Qt.Horizontal)
         self.metronome_volume_slider.setRange(0, 100)
@@ -247,8 +251,9 @@ class MainWindow(QMainWindow):
         self.busy_bar.setVisible(False)
         sidebar_layout.addWidget(self.busy_bar)
 
-        self.status_label = QLabel("Load audio to begin.")
+        self.status_label = QLabel("Ready. Import audio to begin.")
         self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("font-size: 15px; font-weight: 600; color: #f2f2f2; padding: 6px 0;")
         sidebar_layout.addWidget(self.status_label)
 
         plot_container = QWidget()
@@ -293,7 +298,7 @@ class MainWindow(QMainWindow):
         self.project.song_name = song_path.stem
         self.song_name.setText(song_path.stem)
         self.player.setSource(QUrl.fromLocalFile(str(song_path)))
-        self.status_label.setText(f"Loaded {song_path.name}. Run Auto Detect next.")
+        self._set_status(f"Loaded {song_path.name}. Run Auto Detect next.")
 
     def _push_undo(self) -> None:
         self._undo_stack.append({
@@ -320,7 +325,7 @@ class MainWindow(QMainWindow):
         self._draw_beat_grid()
         self._refresh_sections()
         self.undo_button.setEnabled(bool(self._undo_stack))
-        self.status_label.setText("Undone.")
+        self._set_status("Undid the last mapper change.")
 
     def _auto_detect(self) -> None:
         if not self.project.audio_path:
@@ -343,7 +348,7 @@ class MainWindow(QMainWindow):
             self._sync_controls()
             self._draw_waveform()
             self._refresh_sections()
-            self.status_label.setText(
+            self._set_status(
                 f"Detected {self.project.base_tempo:.2f} BPM, offset {self.project.beat_offset:.4f}, "
                 f"{len(self.project.tempo_sections)} tempo markers."
             )
@@ -369,7 +374,7 @@ class MainWindow(QMainWindow):
             self.project.tempo_sections,
         )
         if abs(recommended_tempo - original_tempo) < 0.01:
-            self.status_label.setText(
+            self._set_status(
                 f"Recommended setting left the map at {self.project.base_tempo:.2f} BPM."
             )
             return
@@ -378,7 +383,7 @@ class MainWindow(QMainWindow):
         self._sync_controls()
         self._draw_beat_grid()
         self._refresh_sections()
-        self.status_label.setText(
+        self._set_status(
             f"Recommended setting promoted {original_tempo:.2f} BPM to {recommended_tempo:.2f} BPM "
             "for a stronger 4/4 pulse."
         )
@@ -399,9 +404,9 @@ class MainWindow(QMainWindow):
         self._refresh_sections()
         self._draw_beat_grid()
         if changes == 0:
-            self.status_label.setText("Recommended Sections left all tempo markers unchanged.")
+            self._set_status("Recommended Sections left all tempo markers unchanged.")
             return
-        self.status_label.setText(
+        self._set_status(
             f"Recommended Sections promoted {changes} marker"
             f"{'' if changes == 1 else 's'} below 120 BPM to a stronger 4/4 pulse."
         )
@@ -420,7 +425,7 @@ class MainWindow(QMainWindow):
             if abs(original.tempo - updated.tempo) >= 0.01
         )
         if not base_changed and section_changes == 0:
-            self.status_label.setText("Sexy found nothing below 120 BPM to double.")
+            self._set_status("Sexy found nothing below 120 BPM to double.")
             return
         self.project.base_tempo = new_base
         self.project.tempo_sections = new_sections
@@ -432,13 +437,27 @@ class MainWindow(QMainWindow):
             parts.append(f"base {original_base:.2f} → {new_base:.2f} BPM")
         if section_changes:
             parts.append(f"{section_changes} section{'' if section_changes == 1 else 's'} doubled")
-        self.status_label.setText("Sexy: " + ", ".join(parts) + ".")
+        self._set_status("Sexy: " + ", ".join(parts) + ".")
 
     def _apply_song_name(self, value: str) -> None:
         self.project.song_name = value.strip() or "Imported Song"
 
+    def _commit_bpm_spin(self) -> None:
+        self.bpm_spin.interpretText()
+        new_bpm = self.bpm_spin.value()
+        if abs(new_bpm - self.project.base_tempo) < 0.0005:
+            return
+        self._push_undo()
+        self.project.base_tempo = new_bpm
+        self._draw_beat_grid()
+        self._refresh_sections()
+        self._set_status(f"Applied BPM {new_bpm:.3f}.")
+
+    def _pending_marker_tempo(self) -> float:
+        self.bpm_spin.interpretText()
+        return self.bpm_spin.value()
+
     def _update_project_from_controls(self) -> None:
-        self.project.base_tempo = self.bpm_spin.value()
         self.project.beat_offset = self.offset_spin.value()
         self.project.start_song_offset = self.start_spin.value()
         self.project.end_song_offset = self.end_spin.value()
@@ -541,6 +560,49 @@ class MainWindow(QMainWindow):
         end = min(section.start_time + span * 0.75, self.project.duration or section.start_time + span)
         self.plot.setXRange(start, end, padding=0.02)
 
+    def _open_section_context_menu(self, position) -> None:
+        item = self.section_list.itemAt(position)
+        if item is None:
+            return
+        row = self.section_list.row(item)
+        if row < 0 or row >= len(self.project.tempo_sections):
+            return
+        self.section_list.setCurrentRow(row)
+        menu = QMenu(self)
+        edit_bpm_action = menu.addAction("Edit BPM")
+        chosen_action = menu.exec(self.section_list.mapToGlobal(position))
+        if chosen_action == edit_bpm_action:
+            self._edit_selected_section_bpm()
+
+    def _edit_selected_section_bpm(self) -> None:
+        row = self.section_list.currentRow()
+        if row < 0 or row >= len(self.project.tempo_sections):
+            return
+        section = self.project.tempo_sections[row]
+        new_tempo, accepted = QInputDialog.getDouble(
+            self,
+            "Edit Section BPM",
+            "Tempo",
+            section.tempo,
+            40.0,
+            260.0,
+            3,
+        )
+        if not accepted:
+            return
+        if abs(new_tempo - section.tempo) < 0.0005:
+            return
+        self._push_undo()
+        self.project.tempo_sections[row] = TempoSection(
+            tempo=new_tempo,
+            start_time=section.start_time,
+            confidence=1.0,
+        )
+        self.project.tempo_sections.sort(key=lambda item: item.start_time)
+        self._refresh_sections()
+        self._draw_beat_grid()
+        self._set_status(f"Updated section BPM to {new_tempo:.3f}.")
+
     def _handle_plot_click(self, event) -> None:
         if event.button() != Qt.LeftButton:
             return
@@ -559,22 +621,8 @@ class MainWindow(QMainWindow):
     def _add_marker_at_playhead(self) -> None:
         self._push_undo()
         time_value = self._cursor_seconds()
-        tempo = self.bpm_spin.value()
+        tempo = self._pending_marker_tempo()
         self.project.tempo_sections.append(TempoSection(tempo=tempo, start_time=round(time_value, 4), confidence=1.0))
-        self.project.tempo_sections.sort(key=lambda item: item.start_time)
-        self._refresh_sections()
-        self._draw_beat_grid()
-
-    def _replace_selected_marker(self) -> None:
-        row = self.section_list.currentRow()
-        if row < 0:
-            return
-        self._push_undo()
-        self.project.tempo_sections[row] = TempoSection(
-            tempo=self.bpm_spin.value(),
-            start_time=round(self._cursor_seconds(), 4),
-            confidence=1.0,
-        )
         self.project.tempo_sections.sort(key=lambda item: item.start_time)
         self._refresh_sections()
         self._draw_beat_grid()
@@ -618,6 +666,10 @@ class MainWindow(QMainWindow):
     def _update_metronome_volume(self, value: int) -> None:
         self.metronome_sound.setVolume(max(0.0, min(1.0, value / 100.0)))
         self.settings.setValue("metronome_volume", value)
+
+    def _update_music_volume(self, value: int) -> None:
+        self.audio_output.setVolume(max(0.0, min(1.0, value / 100.0)))
+        self.settings.setValue("music_volume", value)
 
     def _prime_metronome(self) -> None:
         current_ms = self.player.position()
@@ -668,7 +720,7 @@ class MainWindow(QMainWindow):
             return
         finally:
             self._set_busy(False)
-        self.status_label.setText(f"Exported to {output}. Ready for the next song.")
+        self._set_status(f"Exported to {output}. Ready for the next song.")
         self.statusBar().showMessage(f"Exported to {output}", 5000)
 
     def _choose_import_folder(self) -> None:
@@ -694,6 +746,8 @@ class MainWindow(QMainWindow):
     def _load_settings(self) -> None:
         self.import_folder_edit.setText(str(self.settings.value("import_folder", "")))
         self.export_folder_edit.setText(str(self.settings.value("export_folder", "")))
+        music_volume_value = int(self.settings.value("music_volume", 80))
+        self.music_volume_slider.setValue(max(0, min(100, music_volume_value)))
         volume_value = int(self.settings.value("metronome_volume", 18))
         self.metronome_volume_slider.setValue(max(0, min(100, volume_value)))
 
@@ -713,6 +767,10 @@ class MainWindow(QMainWindow):
         self.auto_button.setEnabled(self._busy_depth == 0)
         self.export_button.setEnabled(self._busy_depth == 0)
         QApplication.processEvents()
+
+    def _set_status(self, message: str) -> None:
+        self.status_label.setText(message)
+        self.statusBar().showMessage(message, 5000)
 
     def _ensure_metronome_sound(self) -> Path:
         sound_path = Path(tempfile.gettempdir()) / "dead_as_disco_soft_ding.wav"
