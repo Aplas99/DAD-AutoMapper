@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pyqtgraph as pg
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import QEvent, QObject, QSettings, QTimer, Qt, QUrl
+from PySide6.QtCore import QEvent, QObject, QSettings, QThread, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QSoundEffect
 from PySide6.QtWidgets import (
@@ -33,9 +33,24 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .analysis import analyze_audio, recommended_section_tempo_mapping, recommended_tempo_mapping, sexy_tempo_mapping
+from .analysis import analyze_audio, analyze_section_feel, recommended_section_tempo_mapping, recommended_tempo_mapping, sexy_tempo_mapping
 from .exporter import export_project
 from .models import AnalysisResult, SongProject, TempoSection
+
+
+class _Worker(QObject):
+    finished = Signal(object)
+    error = Signal(str)
+
+    def __init__(self, fn) -> None:
+        super().__init__()
+        self._fn = fn
+
+    def run(self) -> None:
+        try:
+            self.finished.emit(self._fn())
+        except Exception as exc:
+            self.error.emit(str(exc))
 
 
 class _MMBOffsetFilter(QObject):
@@ -98,6 +113,7 @@ class MainWindow(QMainWindow):
         self.metronome_sound.setSource(QUrl.fromLocalFile(str(self._ensure_metronome_sound())))
 
         self._undo_stack: list[dict] = []
+        self._selected_section_range: tuple[float, float] | None = None
 
         self._build_ui()
         self._load_settings()
@@ -151,6 +167,11 @@ class MainWindow(QMainWindow):
         self.recommended_sections_button.clicked.connect(self._apply_recommended_sections)
         sidebar_layout.addWidget(self.recommended_sections_button)
 
+        self.doubletime_button = QPushButton("Doubletime")
+        self.doubletime_button.clicked.connect(self._apply_doubletime)
+        self.doubletime_button.setEnabled(False)
+        sidebar_layout.addWidget(self.doubletime_button)
+
         self.undo_button = QPushButton("Undo")
         self.undo_button.clicked.connect(self._undo)
         self.undo_button.setEnabled(False)
@@ -167,6 +188,7 @@ class MainWindow(QMainWindow):
         self.bpm_spin.setValue(120.0)
         self.bpm_spin.setKeyboardTracking(False)
         self.bpm_spin.lineEdit().returnPressed.connect(self._commit_bpm_spin)
+        self.bpm_spin.valueChanged.connect(self._on_bpm_changed)
         form.addRow("BPM", self.bpm_spin)
 
         self.offset_spin = QDoubleSpinBox()
@@ -206,6 +228,10 @@ class MainWindow(QMainWindow):
         delete_section.clicked.connect(self._delete_selected_marker)
         section_controls.addWidget(delete_section)
         sidebar_layout.addLayout(section_controls)
+
+        self.analyze_feel_button = QPushButton("Analyze Feel")
+        self.analyze_feel_button.clicked.connect(self._analyze_feel)
+        sidebar_layout.addWidget(self.analyze_feel_button)
 
         playback_controls = QHBoxLayout()
         play_button = QPushButton("Play")
@@ -256,6 +282,11 @@ class MainWindow(QMainWindow):
         self.status_label.setStyleSheet("font-size: 15px; font-weight: 600; color: #f2f2f2; padding: 6px 0;")
         sidebar_layout.addWidget(self.status_label)
 
+        version_label = QLabel("BTT v1.1")
+        version_label.setStyleSheet("font-size: 11px; color: #555; padding: 2px 0;")
+        version_label.setAlignment(Qt.AlignRight)
+        sidebar_layout.addWidget(version_label)
+
         plot_container = QWidget()
         plot_layout = QVBoxLayout(plot_container)
         outer.addWidget(plot_container, 1)
@@ -267,6 +298,15 @@ class MainWindow(QMainWindow):
         self.plot.getPlotItem().setLabel("bottom", "Time", units="s")
         self.plot.scene().sigMouseClicked.connect(self._handle_plot_click)
         plot_layout.addWidget(self.plot)
+
+        self._section_highlight = pg.LinearRegionItem(
+            values=[0.0, 0.0],
+            brush=pg.mkBrush(255, 200, 0, 40),
+            pen=pg.mkPen("#ffc800", width=1),
+            movable=False,
+        )
+        self._section_highlight.setVisible(False)
+        self.plot.addItem(self._section_highlight)
 
         self.waveform_curve = self.plot.plot(pen=pg.mkPen("#23d6cf", width=1.1))
         self.waveform_fill_top = self.plot.plot(pen=pg.mkPen("#1ab4ff", width=1.0))
@@ -333,29 +373,37 @@ class MainWindow(QMainWindow):
             return
         self._push_undo()
         self._set_busy(True, "Analyzing audio...")
-        try:
-            self.analysis_result = analyze_audio(self.project.audio_path)
-            self.project.song_name = self.song_name.text().strip() or self.project.audio_path.stem
-            self.project.base_tempo = self.analysis_result.base_tempo
-            self.project.beat_offset = self.analysis_result.beat_offset
-            self.project.beat_times = list(self.analysis_result.beat_times)
-            self.project.tempo_sections = list(self.analysis_result.tempo_sections)
-            self.project.waveform_times = list(self.analysis_result.waveform_times)
-            self.project.waveform_values = list(self.analysis_result.waveform_values)
-            self.project.raw_waveform_values = list(self.analysis_result.raw_waveform_values)
-            self.project.duration = self.analysis_result.duration
-            self.project.sample_rate = self.analysis_result.sample_rate
-            self._sync_controls()
-            self._draw_waveform()
-            self._refresh_sections()
-            self._set_status(
-                f"Detected {self.project.base_tempo:.2f} BPM, offset {self.project.beat_offset:.4f}, "
-                f"{len(self.project.tempo_sections)} tempo markers."
-            )
-        except Exception as exc:  # pragma: no cover - surfaced in UI
-            QMessageBox.critical(self, "Analysis Failed", str(exc))
-        finally:
-            self._set_busy(False)
+        audio_path = self.project.audio_path
+        self._run_in_thread(
+            lambda: analyze_audio(audio_path),
+            self._on_analysis_done,
+            self._on_analysis_error,
+        )
+
+    def _on_analysis_done(self, result: AnalysisResult) -> None:
+        self.analysis_result = result
+        self.project.song_name = self.song_name.text().strip() or self.project.audio_path.stem
+        self.project.base_tempo = result.base_tempo
+        self.project.beat_offset = result.beat_offset
+        self.project.beat_times = list(result.beat_times)
+        self.project.tempo_sections = list(result.tempo_sections)
+        self.project.waveform_times = list(result.waveform_times)
+        self.project.waveform_values = list(result.waveform_values)
+        self.project.raw_waveform_values = list(result.raw_waveform_values)
+        self.project.duration = result.duration
+        self.project.sample_rate = result.sample_rate
+        self._sync_controls()
+        self._draw_waveform()
+        self._refresh_sections()
+        self._set_status(
+            f"Detected {self.project.base_tempo:.2f} BPM, offset {self.project.beat_offset:.4f}, "
+            f"{len(self.project.tempo_sections)} tempo markers."
+        )
+        self._set_busy(False)
+
+    def _on_analysis_error(self, message: str) -> None:
+        QMessageBox.critical(self, "Analysis Failed", message)
+        self._set_busy(False)
 
     def _sync_controls(self) -> None:
         self.bpm_spin.setValue(self.project.base_tempo)
@@ -439,6 +487,110 @@ class MainWindow(QMainWindow):
             parts.append(f"{section_changes} section{'' if section_changes == 1 else 's'} doubled")
         self._set_status("Sexy: " + ", ".join(parts) + ".")
 
+    def _run_in_thread(self, fn, on_done, on_error) -> None:
+        # Store on self so Python doesn't GC the worker before it emits finished.
+        self._bg_worker = _Worker(fn)
+        self._bg_thread = QThread(self)
+        self._bg_worker.moveToThread(self._bg_thread)
+        self._bg_thread.started.connect(self._bg_worker.run)
+        self._bg_worker.finished.connect(on_done)
+        self._bg_worker.error.connect(on_error)
+        self._bg_worker.finished.connect(self._bg_thread.quit)
+        self._bg_worker.error.connect(self._bg_thread.quit)
+        self._bg_thread.start()
+
+    def _section_range_at(self, time: float) -> tuple[float, float]:
+        boundaries = (
+            [0.0]
+            + sorted(s.start_time for s in self.project.tempo_sections)
+            + [self.project.duration]
+        )
+        for i in range(len(boundaries) - 1):
+            if boundaries[i] <= time <= boundaries[i + 1]:
+                return (boundaries[i], boundaries[i + 1])
+        return (0.0, self.project.duration)
+
+    def _on_bpm_changed(self, value: float) -> None:
+        self.doubletime_button.setEnabled(value < 115.0)
+
+    def _apply_doubletime(self) -> None:
+        if self.project.base_tempo <= 0 or self.project.base_tempo >= 115.0:
+            return
+        self._push_undo()
+        new_bpm = round(self.project.base_tempo * 2.0, 3)
+        beat_times = self.project.beat_times
+        if beat_times:
+            new_beat_length = 60.0 / new_bpm
+            new_offset = round(beat_times[0] % new_beat_length, 4)
+        else:
+            new_offset = self.project.beat_offset
+        self.project.base_tempo = new_bpm
+        self.project.beat_offset = new_offset
+        self._sync_controls()
+        self._draw_beat_grid()
+        self._refresh_sections()
+        self._set_status(f"Doubled global BPM to {new_bpm:.3f}. Offset aligned to first beat.")
+
+    def _analyze_feel(self) -> None:
+        if not self.project.audio_path:
+            QMessageBox.warning(self, "No Audio", "Load an audio file first.")
+            return
+        if self._selected_section_range is not None:
+            start, end = self._selected_section_range
+        else:
+            start, end = 0.0, self.project.duration
+        if end - start < 3.0:
+            QMessageBox.information(self, "Too Short", "Select a longer section to analyze.")
+            return
+        audio_path = self.project.audio_path
+        base_tempo = self.project.base_tempo
+        self._set_busy(True, "Analyzing feel...")
+        self._run_in_thread(
+            lambda: analyze_section_feel(audio_path, base_tempo, start, end),
+            self._on_feel_done,
+            self._on_feel_error,
+        )
+
+    def _on_feel_done(self, result: dict) -> None:
+        self._set_busy(False)
+        feel = result["feel"].replace("_", "-")
+        conf = result["confidence"]
+        ratio = result["density_ratio"]
+        change_points = result["change_points"]
+        lines = [
+            f"Feel: {feel}  (confidence {conf:.2f})",
+            f"Onset density ratio: {ratio:.2f}",
+            f"  base score: {result['base_score']:.3f}",
+            f"  double score: {result['double_score']:.3f}",
+            f"  half score: {result['half_score']:.3f}",
+        ]
+        if change_points:
+            lines.append(f"\nPacing shifts at: {', '.join(f'{t:.2f}s' for t in change_points)}")
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Section Feel Analysis")
+        msg.setText("\n".join(lines))
+        add_markers_btn = None
+        if change_points:
+            add_markers_btn = msg.addButton("Add Shift Markers", QMessageBox.ButtonRole.AcceptRole)
+        msg.addButton(QMessageBox.StandardButton.Close)
+        msg.exec()
+        if add_markers_btn is not None and msg.clickedButton() == add_markers_btn:
+            self._push_undo()
+            for t in change_points:
+                self.project.tempo_sections.append(TempoSection(
+                    tempo=self.project.base_tempo,
+                    start_time=round(t, 4),
+                    confidence=0.5,
+                ))
+            self.project.tempo_sections.sort(key=lambda s: s.start_time)
+            self._refresh_sections()
+            self._draw_beat_grid()
+            self._set_status(f"Added {len(change_points)} pacing shift marker(s).")
+
+    def _on_feel_error(self, message: str) -> None:
+        QMessageBox.critical(self, "Analysis Failed", message)
+        self._set_busy(False)
+
     def _apply_song_name(self, value: str) -> None:
         self.project.song_name = value.strip() or "Imported Song"
 
@@ -465,6 +617,8 @@ class MainWindow(QMainWindow):
         self._refresh_sections()
 
     def _draw_waveform(self) -> None:
+        self._selected_section_range = None
+        self._section_highlight.setVisible(False)
         times = self.project.waveform_times
         peaks = self.project.waveform_values
         raw = self.project.raw_waveform_values or [0.0 for _ in peaks]
@@ -604,9 +758,18 @@ class MainWindow(QMainWindow):
         self._set_status(f"Updated section BPM to {new_tempo:.3f}.")
 
     def _handle_plot_click(self, event) -> None:
+        mouse_point = self.plot.getPlotItem().vb.mapSceneToView(event.scenePos())
+        if event.button() == Qt.LeftButton and event.modifiers() & Qt.ShiftModifier:
+            if self.project.duration <= 0:
+                return
+            t = max(0.0, min(mouse_point.x(), self.project.duration))
+            start, end = self._section_range_at(t)
+            self._selected_section_range = (start, end)
+            self._section_highlight.setRegion([start, end])
+            self._section_highlight.setVisible(True)
+            return
         if event.button() != Qt.LeftButton:
             return
-        mouse_point = self.plot.getPlotItem().vb.mapSceneToView(event.scenePos())
         bounded = max(0.0, min(mouse_point.x(), self.project.duration or mouse_point.x()))
         self.playhead_line.setPos(bounded)
 

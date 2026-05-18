@@ -121,7 +121,7 @@ def analyze_with_btt(
         library.lib.btt_destroy(btt)
 
     base_tempo = _choose_base_tempo(tempo_updates, final_bpm)
-    beat_offset = _estimate_beat_offset(beat_times, base_tempo)
+    beat_offset = _first_noticeable_beat(beat_times, onset_times, base_tempo)
     tempo_sections = _derive_tempo_sections(tempo_updates, beat_times, base_tempo, duration)
 
     return BTTAnalysisResult(
@@ -331,12 +331,24 @@ def _derive_tempo_sections(
     return sections
 
 
-def _estimate_beat_offset(beat_times: list[float], tempo: float) -> float:
-    if len(beat_times) < 2 or tempo <= 0:
+def _first_noticeable_beat(beat_times: list[float], onset_times: list[float], tempo: float) -> float:
+    """Return the time of the first beat that coincides with a detected onset.
+
+    Scans beat_times in order and returns the earliest one where an onset lands
+    within a quarter-beat window.  Falls back to beat_times[0] when no onset
+    match is found so the grid still starts somewhere sensible.
+    """
+    if not beat_times:
         return 0.0
+    if not onset_times or tempo <= 0:
+        return round(beat_times[0], 4)
     beat_length = 60.0 / float(tempo)
-    reference = beat_times[0]
-    return round(reference % beat_length, 4)
+    tolerance = beat_length * 0.25
+    onset_array = np.array(onset_times, dtype=float)
+    for bt in beat_times:
+        if np.any(np.abs(onset_array - bt) <= tolerance):
+            return round(bt, 4)
+    return round(beat_times[0], 4)
 
 
 def _snap_time_to_beats(value: float, beat_times: list[float]) -> float:

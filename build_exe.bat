@@ -14,6 +14,7 @@ python -m PyInstaller ^
   --hidden-import scipy ^
   --hidden-import sklearn ^
   --add-binary "C:\Users\V1Sta\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-7.1-full_build\bin\ffmpeg.exe;." ^
+  --add-binary "build\btt\btt.dll;." ^
   --paths . ^
   run_mapper.py
 

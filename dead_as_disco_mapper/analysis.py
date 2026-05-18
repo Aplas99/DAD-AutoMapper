@@ -122,7 +122,9 @@ def analyze_audio(audio_path: str | Path, config: DetectionConfig | None = None)
     tempo, beat_frames = librosa.beat.beat_track(y=samples, sr=sr, onset_envelope=onset_env, trim=False)
     tempo_value = _coerce_tempo(tempo)
     beat_times = librosa.frames_to_time(beat_frames, sr=sr).tolist()
-    beat_offset = _estimate_beat_offset(beat_times, tempo_value)
+    onset_frames = librosa.onset.onset_detect(onset_envelope=onset_env, sr=sr)
+    onset_times = librosa.frames_to_time(onset_frames, sr=sr).tolist()
+    beat_offset = _first_noticeable_beat(beat_times, onset_times, tempo_value)
     base_tempo = _refine_base_tempo(_snap_tempo(tempo_value))
 
     sections = _detect_sections(
@@ -178,6 +180,102 @@ def sexy_tempo_mapping(base_tempo: float, sections: list[TempoSection]) -> tuple
     return new_base, new_sections
 
 
+def _feel_change_points(
+    samples: np.ndarray,
+    sr: int,
+    base_tempo: float,
+    duration: float,
+    time_offset: float,
+    window: float = 8.0,
+    step: float = 4.0,
+    threshold: float = 0.55,
+) -> list[float]:
+    if duration < window * 2:
+        return []
+    expected = base_tempo / 60.0
+    densities: list[tuple[float, float]] = []
+    t = 0.0
+    while t + window <= duration:
+        start_s = int(t * sr)
+        end_s = min(int((t + window) * sr), len(samples))
+        env = librosa.onset.onset_strength(y=samples[start_s:end_s], sr=sr, aggregate=np.median)
+        n = len(librosa.onset.onset_detect(onset_envelope=env, sr=sr))
+        densities.append((t + window / 2.0, n / window / max(expected, 0.001)))
+        t += step
+    if len(densities) < 3:
+        return []
+    changes: list[float] = []
+    for i in range(1, len(densities)):
+        prev = densities[i - 1][1]
+        curr = densities[i][1]
+        if abs(curr - prev) > threshold:
+            changes.append(round(time_offset + densities[i][0] - window / 2.0, 3))
+    deduped: list[float] = []
+    for t_val in sorted(set(changes)):
+        if not deduped or t_val - deduped[-1] >= window:
+            deduped.append(t_val)
+    return deduped
+
+
+def analyze_section_feel(
+    audio_path: str | Path,
+    base_tempo: float,
+    start_time: float,
+    end_time: float,
+    sample_rate: int = 22050,
+) -> dict[str, object]:
+    """Detect rhythmic pacing and feel within a time window.
+
+    Compares onset density and beat-grid alignment at base, double, and half
+    tempo to classify the region as normal, double-time, or half-time feel,
+    and returns absolute timestamps where the pacing noticeably shifts.
+    """
+    samples, sr = librosa.load(
+        Path(audio_path), sr=sample_rate, mono=True,
+        offset=start_time, duration=end_time - start_time,
+    )
+    if len(samples) < sr * 3:
+        return {
+            "feel": "unknown", "confidence": 0.0, "density_ratio": 1.0,
+            "base_score": 0.0, "double_score": 0.0, "half_score": 0.0,
+            "change_points": [],
+        }
+
+    onset_env = librosa.onset.onset_strength(y=samples, sr=sr, aggregate=np.median)
+    duration = len(samples) / sr
+
+    base_score = _beat_consistency_score(onset_env, sr, base_tempo)
+    double_score = _beat_consistency_score(onset_env, sr, base_tempo * 2.0)
+    half_score = _beat_consistency_score(onset_env, sr, max(base_tempo * 0.5, 30.0))
+
+    onset_frames = librosa.onset.onset_detect(onset_envelope=onset_env, sr=sr)
+    onset_density = len(onset_frames) / max(duration, 0.001)
+    expected_density = base_tempo / 60.0
+    density_ratio = onset_density / max(expected_density, 0.001)
+
+    feel = "normal"
+    confidence = 0.0
+    double_advantage = double_score - base_score
+    if double_advantage > 0.06 or density_ratio > 1.7:
+        feel = "double_time"
+        confidence = round(min(0.95, max(double_advantage * 4.0, (density_ratio - 1.0) * 0.4)), 3)
+    elif half_score >= base_score - 0.04 and density_ratio < 0.65:
+        feel = "half_time"
+        confidence = round(min(0.95, (1.0 - density_ratio) * 1.5), 3)
+
+    change_points = _feel_change_points(samples, sr, base_tempo, duration, start_time)
+
+    return {
+        "feel": feel,
+        "confidence": confidence,
+        "density_ratio": round(density_ratio, 3),
+        "base_score": round(base_score, 3),
+        "double_score": round(double_score, 3),
+        "half_score": round(half_score, 3),
+        "change_points": change_points,
+    }
+
+
 def recommended_section_tempo_mapping(sections: list[TempoSection], threshold: float = 120.0) -> list[TempoSection]:
     adjusted_sections: list[TempoSection] = []
     for section in sections:
@@ -201,12 +299,24 @@ def _recommended_tempo_multiplier(base_tempo: float, threshold: float = 120.0) -
     return multiplier
 
 
-def _estimate_beat_offset(beat_times: list[float], tempo: float) -> float:
-    if len(beat_times) < 2 or tempo <= 0:
+def _first_noticeable_beat(beat_times: list[float], onset_times: list[float], tempo: float) -> float:
+    """Return the time of the first beat that coincides with a detected onset.
+
+    Scans beat_times in order and returns the earliest one where an onset lands
+    within a quarter-beat window.  Falls back to beat_times[0] when no onset
+    match is found so the grid still starts somewhere sensible.
+    """
+    if not beat_times:
         return 0.0
+    if not onset_times or tempo <= 0:
+        return round(beat_times[0], 4)
     beat_length = 60.0 / float(tempo)
-    reference = beat_times[0]
-    return round(reference % beat_length, 4)
+    tolerance = beat_length * 0.25
+    onset_array = np.array(onset_times)
+    for bt in beat_times:
+        if np.any(np.abs(onset_array - bt) <= tolerance):
+            return round(bt, 4)
+    return round(beat_times[0], 4)
 
 
 def _sections_from_boundaries(
